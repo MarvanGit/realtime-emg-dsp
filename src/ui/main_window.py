@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
 
 from src.core.data_source import FileDataSource, LiveDataSource
 from src.core.data_worker import DataWorker
+from src.core.dsp_live import DSPLive
+from src.core.dsp_review import DSPReview
 
 
 class MainWindow(QMainWindow):
@@ -32,7 +34,15 @@ class MainWindow(QMainWindow):
 
     LIVE_MODE = "live"
     REVIEW_MODE = "review"
+    ORIGINAL_SIGNAL = "original"
+    FILTERED_SIGNAL = "filtered"
+    RMS_SIGNAL = "rms"
+    PROCESSED_SIGNAL = "processed"
     DEFAULT_REVIEW_SAMPLING_RATE = 2000
+    DSP_LOW_CUT = 20.0
+    DSP_HIGH_CUT = 450.0
+    DSP_FILTER_ORDER = 4
+    DSP_RMS_WINDOW_MS = 100.0
 
     def __init__(self):
         super().__init__()
@@ -41,8 +51,12 @@ class MainWindow(QMainWindow):
         self.current_mode = self.REVIEW_MODE
         self.data_source = None
         self.data_worker = None
+        self.review_dsp = DSPReview()
+        self.review_signal_cache = {}
+        self.live_dsp = None
         self.num_channels = 0
         self.current_gain = 1
+        self.current_signal_view = self.ORIGINAL_SIGNAL
         self.is_paused = False
 
         self.setWindowTitle("EMG Data Visualization")
@@ -80,6 +94,8 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_data_stream)
         self.load_button = QPushButton("Load File")
         self.load_button.clicked.connect(self.open_data_file_dialog)
+        self.signal_view_combo = QComboBox()
+        self.signal_view_combo.currentIndexChanged.connect(self.handle_signal_view_changed)
 
         self.gain_slider = QSlider(Qt.Horizontal)
         self.gain_slider.setRange(1, 20)
@@ -93,6 +109,8 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.pause_button)
         controls_layout.addWidget(self.stop_button)
         controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(QLabel("Signal:"))
+        controls_layout.addWidget(self.signal_view_combo)
         controls_layout.addStretch()
         controls_layout.addWidget(self.gain_label)
         controls_layout.addWidget(self.gain_slider)
@@ -115,6 +133,7 @@ class MainWindow(QMainWindow):
         self.plot_items = []
         self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
 
+        self.configure_signal_view_options()
         self.load_review_data_source(self.data_file_path)
         self.refresh_mode_controls()
         self.statusBar().showMessage("Ready")
@@ -127,8 +146,10 @@ class MainWindow(QMainWindow):
             sampling_rate = self.read_sampling_rate(file_path)
             self.data_source = FileDataSource(file_path=file_path, sampling_rate=sampling_rate)
             self.data_file_path = file_path
-            self.emg_data_buffer = self.data_source.get_data()
-            self.num_channels = self.emg_data_buffer.shape[0]
+            original_data = self.data_source.get_data()
+            self.review_signal_cache = {self.ORIGINAL_SIGNAL: original_data}
+            self.emg_data_buffer = original_data
+            self.num_channels = original_data.shape[0]
             self.current_file_label.setText(f"File: {os.path.basename(file_path)}")
             self.sample_rate_label.setText(f"Sample Rate: {self.data_source.sampling_rate} Hz")
             self.channel_count_label.setText(f"Channels: {self.num_channels}")
@@ -138,6 +159,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.data_source = None
             self.num_channels = 0
+            self.review_signal_cache = {}
             self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
             self.current_file_label.setText("File: -")
             self.sample_rate_label.setText("Sample Rate: -")
@@ -179,12 +201,14 @@ class MainWindow(QMainWindow):
 
         self.current_mode = selected_mode
         self.clear_graphs()
+        self.configure_signal_view_options()
 
         if self.current_mode == self.REVIEW_MODE:
             self.load_review_data_source(self.data_file_path)
             return
 
         self.data_source = LiveDataSource()
+        self.live_dsp = None
         self.num_channels = 0
         self.emg_data_buffer = np.zeros((1, 4000), dtype=np.float64)
         self.current_file_label.setText("File: -")
@@ -202,11 +226,14 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(can_stream_live and not is_streaming)
         self.pause_button.setEnabled(is_streaming)
         self.stop_button.setEnabled(is_streaming)
+        can_select_signal_view = (
+            is_review_mode and self.num_channels > 0
+        ) or self.current_mode == self.LIVE_MODE
+        self.signal_view_combo.setEnabled(can_select_signal_view)
         if not is_streaming:
             self.pause_button.setText("Pause")
             self.is_paused = False
- 
-    # 
+
     def can_stream_live_data(self) -> bool:
         if self.data_source is None:
             return False
@@ -215,6 +242,51 @@ class MainWindow(QMainWindow):
         sampling_rate = getattr(self.data_source, "sampling_rate", None)
         chunk_size = getattr(self.data_source, "chunk_size", None)
         return callable(get_chunk) and sampling_rate is not None and chunk_size is not None
+
+    def configure_signal_view_options(self):
+        previous_view = self.current_signal_view
+        if self.current_mode == self.REVIEW_MODE:
+            options = (
+                ("Original Signal", self.ORIGINAL_SIGNAL),
+                ("Filtered", self.FILTERED_SIGNAL),
+                ("RMS", self.RMS_SIGNAL),
+            )
+        else:
+            options = (
+                ("Original", self.ORIGINAL_SIGNAL),
+                ("Processed", self.PROCESSED_SIGNAL),
+            )
+
+        self.signal_view_combo.blockSignals(True)
+        self.signal_view_combo.clear()
+        selected_index = 0
+        for index, (label, value) in enumerate(options):
+            self.signal_view_combo.addItem(label, value)
+            if value == previous_view:
+                selected_index = index
+        self.signal_view_combo.setCurrentIndex(selected_index)
+        self.current_signal_view = self.signal_view_combo.currentData()
+        self.signal_view_combo.blockSignals(False)
+
+    def handle_signal_view_changed(self):
+        self.current_signal_view = self.signal_view_combo.currentData()
+
+        if self.current_mode == self.REVIEW_MODE:
+            self.render_review_data()
+            return
+
+        self.live_dsp = None
+        if self.num_channels > 0:
+            self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+        self.update_status(f"Live view set to {self.signal_view_combo.currentText()}.")
+
+    def get_dsp_band(self, sampling_rate: float) -> tuple[float, float]:
+        nyquist = sampling_rate * 0.5
+        highcut = min(self.DSP_HIGH_CUT, nyquist - 1.0)
+        lowcut = min(self.DSP_LOW_CUT, highcut * 0.5)
+        if lowcut <= 0 or highcut <= lowcut:
+            raise ValueError(f"Invalid DSP band for {sampling_rate} Hz sampling rate.")
+        return lowcut, highcut
 
     def build_graphs(self):
         self.graph_layout.clear()
@@ -279,12 +351,112 @@ class MainWindow(QMainWindow):
         if self.current_mode != self.REVIEW_MODE or self.num_channels == 0:
             return
 
+        try:
+            self.emg_data_buffer = self.get_review_signal_data(self.current_signal_view)
+        except Exception as exc:
+            self.update_status(f"Failed to apply review DSP: {exc}")
+            return
+
         for channel_index, curve in enumerate(self.curves):
             curve.setData(self.emg_data_buffer[channel_index, :])
+        self.update_status(f"Review view set to {self.signal_view_combo.currentText()}.")
+
+    def get_review_signal_data(self, signal_view: str) -> np.ndarray:
+        if signal_view in self.review_signal_cache:
+            return self.review_signal_cache[signal_view]
+
+        original_data = self.review_signal_cache[self.ORIGINAL_SIGNAL]
+        sampling_rate = self.data_source.sampling_rate
+        lowcut, highcut = self.get_dsp_band(sampling_rate)
+
+        if self.FILTERED_SIGNAL not in self.review_signal_cache:
+            self.review_signal_cache[self.FILTERED_SIGNAL] = DSPReview.bandpass_filter(
+                original_data,
+                lowcut=lowcut,
+                highcut=highcut,
+                fs=sampling_rate,
+                order=self.DSP_FILTER_ORDER,
+            )
+
+        if signal_view == self.FILTERED_SIGNAL:
+            return self.review_signal_cache[self.FILTERED_SIGNAL]
+
+        if signal_view == self.RMS_SIGNAL:
+            self.review_signal_cache[self.RMS_SIGNAL] = self.review_dsp.rms_envelope(
+                self.review_signal_cache[self.FILTERED_SIGNAL],
+                sampling_rate=sampling_rate,
+                window_ms=self.DSP_RMS_WINDOW_MS,
+            )
+            return self.review_signal_cache[self.RMS_SIGNAL]
+
+        return original_data
+
+    def prepare_live_stream(self):
+        self.live_dsp = None
+        live_channels = self.get_live_num_channels()
+        if live_channels <= 0:
+            return
+
+        self.num_channels = live_channels
+        self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+        self.channel_count_label.setText(f"Channels: {self.num_channels}")
+        self.sample_rate_label.setText(f"Sample Rate: {self.data_source.sampling_rate} Hz")
+        self.build_graphs()
+
+    def get_live_num_channels(self) -> int:
+        if self.data_source is None:
+            return 0
+
+        get_num_channels = getattr(self.data_source, "get_num_channels", None)
+        if callable(get_num_channels):
+            try:
+                return int(get_num_channels())
+            except Exception:
+                return 0
+
+        for attribute in ("num_channels", "number_of_channels"):
+            value = getattr(self.data_source, attribute, None)
+            if value is not None:
+                return int(value)
+        return 0
+
+    def prepare_live_display_for_chunk(self, data_chunk: np.ndarray):
+        if self.num_channels == data_chunk.shape[0]:
+            return
+
+        self.num_channels = data_chunk.shape[0]
+        self.emg_data_buffer = np.zeros((self.num_channels, 4000), dtype=np.float64)
+        self.channel_count_label.setText(f"Channels: {self.num_channels}")
+        self.build_graphs()
+
+    def process_live_chunk(self, data_chunk: np.ndarray) -> np.ndarray:
+        if self.current_signal_view != self.PROCESSED_SIGNAL:
+            return data_chunk
+
+        if self.live_dsp is None or self.live_dsp.num_channels != data_chunk.shape[0]:
+            lowcut, highcut = self.get_dsp_band(self.data_source.sampling_rate)
+            self.live_dsp = DSPLive(
+                num_channels=data_chunk.shape[0],
+                sampling_rate=self.data_source.sampling_rate,
+                lowcut=lowcut,
+                highcut=highcut,
+                filter_order=self.DSP_FILTER_ORDER,
+                rms_window_ms=self.DSP_RMS_WINDOW_MS,
+            )
+
+        return self.live_dsp.process_chunk(data_chunk)
 
     def update_graph(self, data_chunk: np.ndarray):
-        if self.num_channels == 0 or data_chunk.size == 0:
+        if data_chunk.size == 0:
             return
+
+        data_chunk = np.asarray(data_chunk)
+        if data_chunk.ndim == 1:
+            data_chunk = data_chunk.reshape(1, -1)
+
+        if self.current_mode == self.LIVE_MODE:
+            data_chunk = self.process_live_chunk(data_chunk)
+            self.prepare_live_display_for_chunk(data_chunk)
 
         self.emg_data_buffer = np.roll(self.emg_data_buffer, -data_chunk.shape[1], axis=1)
         self.emg_data_buffer[:, -data_chunk.shape[1]:] = data_chunk
@@ -310,6 +482,7 @@ class MainWindow(QMainWindow):
             self.update_status("Data stream already running.")
             return
 
+        self.prepare_live_stream()
         self.data_worker = DataWorker(data_source=self.data_source)
         self.data_worker.data_chunk_signal.connect(self.update_graph)
         self.data_worker.finished.connect(self.on_worker_finished)
