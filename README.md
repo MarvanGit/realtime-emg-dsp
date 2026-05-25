@@ -1,4 +1,4 @@
-# Realtime EMG DSP
+# Asynchronous Telemetry & Biosignal Processing Framework
 
 A desktop application for loading, visualizing, and analyzing multi-channel EMG recordings. The app currently focuses on review-mode workflows for `.pkl` recordings, with a live-streaming architecture in place for future hardware integration.
 
